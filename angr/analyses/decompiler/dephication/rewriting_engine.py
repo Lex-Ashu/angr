@@ -5,27 +5,23 @@ import logging
 from ailment.block import Block
 from ailment.statement import Statement, Assignment, Store, Call, Return, ConditionalJump
 from ailment.expression import (
-    Register,
+    Expression,
     VirtualVariable,
     Load,
-    Const,
     BinaryOp,
+    UnaryOp,
     Phi,
     Convert,
-    StackBaseOffset,
     ITE,
 )
 
-from angr.engines.light import SimEngineLight, SimEngineLightAILMixin
+from angr.engines.light import SimEngineNostmtAIL
 
 
 _l = logging.getLogger(__name__)
 
 
-class SimEngineDephiRewriting(
-    SimEngineLightAILMixin,
-    SimEngineLight,
-):
+class SimEngineDephiRewriting(SimEngineNostmtAIL[None, Expression | None, Statement | tuple[Statement, ...], None]):
     """
     This engine rewrites every block to insert phi variables and replaces every used variable with their versioned
     copies at each use location.
@@ -35,14 +31,21 @@ class SimEngineDephiRewriting(
 
     def __init__(
         self,
-        arch,
+        project,
         vvar_to_vvar: dict[int, int],
     ):
-        super().__init__()
+        super().__init__(project)
 
-        self.arch = arch
         self.vvar_to_vvar = vvar_to_vvar
         self.out_block = None
+
+        self._stmt_handlers["IncompleteSwitchCaseHeadStatement"] = self._handle_stmt_IncompleteSwitchCaseHeadStatement
+
+    def _top(self, bits):
+        assert False, "Unreachable"
+
+    def _is_top(self, expr):
+        return False
 
     def append_statement(self, stmt: Statement) -> None:
         if self.out_block is None:
@@ -53,18 +56,19 @@ class SimEngineDephiRewriting(
     # Handlers
     #
 
-    def _handle_Stmt(self, stmt: Statement):
-        new_stmt = super()._handle_Stmt(stmt)
-        if new_stmt is not None:
-            if type(new_stmt) is tuple:
-                for s in new_stmt:
-                    self.append_statement(s)
+    def _process_block_end(self, block, stmt_data, whitelist):
+        assert whitelist is None
+        for stmt_idx, new_stmt in enumerate(stmt_data):
+            if new_stmt is not None:
+                if isinstance(new_stmt, tuple):
+                    for stmt_ in new_stmt:
+                        self.append_statement(stmt_)
+                else:
+                    self.append_statement(new_stmt)
             else:
-                self.append_statement(new_stmt)
-        else:
-            self.append_statement(stmt)
+                self.append_statement(block.statements[stmt_idx])
 
-    def _handle_Assignment(self, stmt: Assignment) -> Assignment | tuple[Assignment, ...] | None:
+    def _handle_stmt_Assignment(self, stmt):
         new_src = self._expr(stmt.src)
         new_dst = None
 
@@ -90,7 +94,7 @@ class SimEngineDephiRewriting(
             )
         return None
 
-    def _handle_Store(self, stmt: Store) -> Store | None:
+    def _handle_stmt_Store(self, stmt):
         new_addr = self._expr(stmt.addr)
         new_data = self._expr(stmt.data)
 
@@ -108,7 +112,7 @@ class SimEngineDephiRewriting(
 
         return None
 
-    def _handle_ConditionalJump(self, stmt: ConditionalJump) -> ConditionalJump | None:
+    def _handle_stmt_ConditionalJump(self, stmt):
         new_cond = self._expr(stmt.condition)
         new_true_target = self._expr(stmt.true_target) if stmt.true_target is not None else None
         new_false_target = self._expr(stmt.false_target) if stmt.false_target is not None else None
@@ -125,7 +129,7 @@ class SimEngineDephiRewriting(
             )
         return None
 
-    def _handle_Call(self, stmt: Call) -> Call | None:
+    def _handle_stmt_Call(self, stmt):
         new_target = self._expr(stmt.target) if stmt.target is not None else None
         new_ret_expr = self._expr(stmt.ret_expr) if stmt.ret_expr is not None else None
         new_fp_ret_expr = self._expr(stmt.fp_ret_expr) if stmt.fp_ret_expr is not None else None
@@ -143,16 +147,13 @@ class SimEngineDephiRewriting(
             )
         return None
 
-    def _handle_Register(self, expr: Register) -> None:
-        return None
-
-    def _handle_Load(self, expr: Load) -> Load | None:
+    def _handle_expr_Load(self, expr):
         new_addr = self._expr(expr.addr)
         if new_addr is not None:
             return Load(expr.idx, new_addr, expr.size, expr.endness, guard=expr.guard, alt=expr.alt, **expr.tags)
         return None
 
-    def _handle_Convert(self, expr: Convert) -> Convert | None:
+    def _handle_expr_Convert(self, expr):
         new_operand = self._expr(expr.operand)
         if new_operand is not None:
             return Convert(
@@ -168,13 +169,13 @@ class SimEngineDephiRewriting(
             )
         return None
 
-    def _handle_Const(self, expr: Const) -> None:
+    def _handle_expr_Const(self, expr):
         return None
 
-    def _handle_Phi(self, expr: Phi) -> None:
+    def _handle_expr_Phi(self, expr: Phi) -> None:
         return None
 
-    def _handle_VirtualVariable(self, expr: VirtualVariable) -> VirtualVariable | None:
+    def _handle_expr_VirtualVariable(self, expr: VirtualVariable) -> VirtualVariable | None:
         if expr.varid in self.vvar_to_vvar:
             return VirtualVariable(
                 expr.idx,
@@ -188,13 +189,13 @@ class SimEngineDephiRewriting(
             )
         return None
 
-    def _handle_Return(self, expr: Return) -> Return | None:
-        if expr.ret_exprs is None:
+    def _handle_stmt_Return(self, stmt):
+        if stmt.ret_exprs is None:
             new_ret_exprs = None
         else:
             updated = False
             new_ret_exprs = []
-            for r in expr.ret_exprs:
+            for r in stmt.ret_exprs:
                 new_r = self._expr(r)
                 if new_r is not None:
                     updated = True
@@ -203,10 +204,13 @@ class SimEngineDephiRewriting(
                 new_ret_exprs = None
 
         if new_ret_exprs:
-            return Return(expr.idx, new_ret_exprs, **expr.tags)
+            return Return(stmt.idx, new_ret_exprs, **stmt.tags)
         return None
 
-    def _handle_BinaryOp(self, expr: BinaryOp) -> BinaryOp | None:
+    def _handle_stmt_IncompleteSwitchCaseHeadStatement(self, stmt):
+        return None
+
+    def _handle_expr_BinaryOp(self, expr):
         new_op0 = self._expr(expr.operands[0])
         new_op1 = self._expr(expr.operands[1])
 
@@ -222,13 +226,23 @@ class SimEngineDephiRewriting(
                 bits=expr.bits,
                 floating_point=expr.floating_point,
                 rounding_mode=expr.rounding_mode,
-                from_bits=expr.from_bits,
-                to_bits=expr.to_bits,
                 **expr.tags,
             )
         return None
 
-    def _handle_ITE(self, expr: ITE) -> ITE | None:
+    def _handle_expr_UnaryOp(self, expr):
+        new_op0 = self._expr(expr.operands[0])
+
+        if new_op0 is not None:
+            return UnaryOp(
+                expr.idx,
+                expr.op,
+                expr.operands[0] if new_op0 is None else new_op0,
+                **expr.tags,
+            )
+        return None
+
+    def _handle_expr_ITE(self, expr):
         new_cond = self._expr(expr.cond)
         new_iftrue = self._expr(expr.iftrue)
         new_iffalse = self._expr(expr.iffalse)
@@ -243,5 +257,72 @@ class SimEngineDephiRewriting(
             )
         return None
 
-    def _handle_StackBaseOffset(self, expr: StackBaseOffset) -> None:
+    def _handle_expr_BasePointerOffset(self, expr):
         return None
+
+    def _handle_expr_StackBaseOffset(self, expr):
+        return None
+
+    def _handle_expr_Call(self, expr):
+        return None
+
+    def _handle_expr_DirtyExpression(self, expr):
+        return None
+
+    def _handle_expr_MultiStatementExpression(self, expr):
+        return None
+
+    def _handle_expr_Register(self, expr):
+        return None
+
+    def _handle_expr_Reinterpret(self, expr):
+        return None
+
+    def _handle_expr_Tmp(self, expr):
+        return None
+
+    def _handle_expr_VEXCCallExpression(self, expr):
+        return None
+
+    def _unreachable(self, *args, **kwargs):
+        assert False
+
+    _handle_binop_Add = _unreachable
+    _handle_binop_AddF = _unreachable
+    _handle_binop_AddV = _unreachable
+    _handle_binop_And = _unreachable
+    _handle_binop_Carry = _unreachable
+    _handle_binop_CmpEQ = _unreachable
+    _handle_binop_CmpF = _unreachable
+    _handle_binop_CmpGE = _unreachable
+    _handle_binop_CmpGT = _unreachable
+    _handle_binop_CmpLE = _unreachable
+    _handle_binop_CmpLT = _unreachable
+    _handle_binop_CmpNE = _unreachable
+    _handle_binop_Concat = _unreachable
+    _handle_binop_Div = _unreachable
+    _handle_binop_DivF = _unreachable
+    _handle_binop_LogicalAnd = _unreachable
+    _handle_binop_LogicalOr = _unreachable
+    _handle_binop_Mod = _unreachable
+    _handle_binop_Mul = _unreachable
+    _handle_binop_MulF = _unreachable
+    _handle_binop_MulV = _unreachable
+    _handle_binop_Or = _unreachable
+    _handle_binop_Rol = _unreachable
+    _handle_binop_Ror = _unreachable
+    _handle_binop_SBorrow = _unreachable
+    _handle_binop_SCarry = _unreachable
+    _handle_binop_Sar = _unreachable
+    _handle_binop_Shl = _unreachable
+    _handle_binop_Shr = _unreachable
+    _handle_binop_Sub = _unreachable
+    _handle_binop_SubF = _unreachable
+    _handle_binop_Xor = _unreachable
+    _handle_binop_InterleaveLOV = _unreachable
+    _handle_binop_InterleaveHIV = _unreachable
+    _handle_unop_BitwiseNeg = _unreachable
+    _handle_unop_Dereference = _unreachable
+    _handle_unop_Neg = _unreachable
+    _handle_unop_Not = _unreachable
+    _handle_unop_Reference = _unreachable

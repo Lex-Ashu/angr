@@ -54,8 +54,7 @@ class RewritingAnalysis(ForwardAnalysis[RewritingState, NodeType, object, object
         self._stackvar_locs = stackvar_locs
         self._ail_manager = ail_manager
         self._engine_ail = SimEngineSSARewriting(
-            self.project.arch,
-            project=self.project,
+            self.project,
             sp_tracker=sp_tracker,
             bp_as_gpr=bp_as_gpr,
             udef_to_phiid=self._udef_to_phiid,
